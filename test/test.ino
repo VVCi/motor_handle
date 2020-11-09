@@ -1,74 +1,160 @@
-// PID motor position control.
-// Thanks to Brett Beauregard for his nice PID library http://brettbeauregard.com/blog/2011/04/improving-the-beginners-pid-introduction/
+/* Robot_SimpleMotor_Drive_V0 with encoders
 
-#include <PinChangeInterrupt.h>
-#include "BTS7960.h"
-#include <PID_v1.h>
-#define encodPinA1      2                       // Quadrature encoder A pin
-#define encodPinB1      8                       // Quadrature encoder B pin
+   Adafruit Feather M4 using Pololu TB6612FNG motor controller
+   Drives two motors at fixed speed with PI control
 
-const uint8_t EN = 11;
+   Motor Control Table
+   XIN1   XIN2    Effect
+   Low    Low     Brake
+   Low    High    Forward
+   High   Low     Reverse
 
-/* Define Mode
-  0: Locked Mode
-  1: Auto Handling Mode
-  2: Remode Handling Mode
+   Free to use for all
+   F Milburn, January 2020
 */
-
-/* Define DIR */
-/* DIR: Run Forward: R_PWM - Run Reverse: L_PWM */
-const uint8_t L_PWM = 9;
-const uint8_t R_PWM = 10;
-
-BTS7960 motorController(EN, L_PWM, R_PWM);
-
-double kp = 2000 , ki = 0 , kd = 0.09;             // modify for optimal performance
-double input = 0, output = 0, setpoint = 0;
-long temp;
-volatile long encoderPos = 0;
-PID myPID(&input, &output, &setpoint, kp, ki, kd, DIRECT);  // if motor will only run at full speed try 'REVERSE' instead of 'DIRECT'
-
+#include <PID_v1.h>
+// Output pins used to control motors
+const uint16_t PWMA = 5;         // Motor A PWM control     Orange
+const uint16_t AIN2 = 6;         // Motor A input 2         Brown
+const uint16_t AIN1 = 9;         // Motor A input 1         Green
+const uint16_t BIN1 = 10;        // Motor B input 1         Yellow
+const uint16_t BIN2 = 11;        // Motor B input 2         Purple
+const uint16_t PWMB = 12;        // Motor B PWM control     White
+const uint16_t STBY = 13;        // Standby                 Brown
+// Motor encoder external interrupt pins
+const uint16_t ENCA = A3;        // Encoder A input         Yellow
+const uint16_t ENCB = A2;        // Encoder B input         Green
+// PWM
+const uint16_t ANALOG_WRITE_BITS = 8;
+const uint16_t MAX_PWM = pow(2, ANALOG_WRITE_BITS) - 1;
+const uint16_t MIN_PWM = MAX_PWM / 4;    // Make sure motor turns
+// Motor timing
+unsigned long nowTime = 0;       // updated on every loop
+unsigned long startTimeA = 0;    // start timing A interrupts
+unsigned long startTimeB = 0;    // start timing B interrupts
+unsigned long countIntA = 0;     // count the A interrupts
+unsigned long countIntB = 0;     // count the B interrupts
+double periodA = 0;              // motor A period
+double periodB = 0;              // motor B period
+// PID
+const unsigned long SAMPLE_TIME = 100;  // time between PID updates
+const unsigned long INT_COUNT = 20;     // sufficient interrupts for accurate timing
+double setpointA = 150;         // setpoint is rotational speed in Hz
+double inputA = 0;              // input is PWM to motors
+double outputA = 0;             // output is rotational speed in Hz
+double setpointB = 0;         // setpoint is rotational speed in Hz
+double inputB = 0;              // input is PWM to motors
+double outputB = 0;             // output is rotational speed in Hz
+double KpA = 0.20, KiA = 0.20, KdA = 0;
+double KpB = 0.20, KiB = 0.20, KdB = 0;
+PID motorA(&inputA, &outputA, &setpointA, KpA, KiA, KdA, DIRECT);
+PID motorB(&inputB, &outputB, &setpointB, KpB, KiB, KdB, DIRECT);
+double storeB = 0;               // used for debug print
 void setup() {
-  pinMode(encodPinA1, INPUT_PULLUP);                  // quadrature encoder input A
-  pinMode(encodPinB1, INPUT_PULLUP);                  // quadrature encoder input B
-  attachInterrupt(0, encoder, FALLING);               // update encoder position
-  TCCR1B = TCCR1B & 0b11111000 | 1;                   // set 31KHz PWM to prevent motor noise
-  myPID.SetMode(AUTOMATIC);
-  myPID.SetSampleTime(1);
-  myPID.SetOutputLimits(-255, 255);
-  Serial.begin (115200);                              // for debugging
+  initMotors();
+  initEncoders();
+  initPWM();
+  Serial.begin(115200);
+  while (!Serial) {
+    // wait for serial to start
+  }
 }
-
 void loop() {
-  setpoint = analogRead(A0;                       // modify to fit motor and encoder characteristics, potmeter connected to A0
-  Serial.println(setpoint);
-  input = encoderPos ;                                // data from encoder
-  Serial.println(encoderPos);                      // monitor motor position
-  myPID.Compute();                                    // calculate new output
-  pwmOut(output);                                     // drive L298N H-Bridge module
-  Serial.println(output);
-}
+  nowTime = millis();
+  motorA.Compute();
+  motorB.Compute();
+  forwardA((int)outputA);
+  forwardB((int)outputB);
 
-void pwmOut(int32_t out) {                                // to H-Bridge board
-  if (out > 0) {
-    motor_run(out, 1);
+  if (storeB != outputB) {
+    storeB = outputB;
+    Serial.println("inputA, inputB, errorA, errorB");
+    Serial.print(inputA); Serial.print("  ");
+    Serial.print(inputB); Serial.print("  ");
+    Serial.print(100 * (setpointA - inputA) / setpointA); Serial.print("  ");
+    Serial.print(100 * (setpointB - inputB) / setpointB); Serial.println("\n");
+  }
+}
+void forwardA(uint16_t pwm) {
+  digitalWrite(AIN1, LOW);
+  digitalWrite(AIN2, HIGH);
+  analogWrite(PWMA, pwm);
+}
+void forwardB(uint16_t pwm) {
+  digitalWrite(BIN1, LOW);
+  digitalWrite(BIN2, HIGH);
+  analogWrite(PWMB, pwm);
+}
+void reverseA(uint16_t pwm) {
+  digitalWrite(AIN1, HIGH);
+  digitalWrite(AIN2, LOW);
+  analogWrite(PWMA, pwm);
+}
+void reverseB(uint16_t pwm) {
+  digitalWrite(BIN1, HIGH);
+  digitalWrite(BIN2, LOW);
+  analogWrite(PWMB, pwm);
+}
+void brakeA() {
+  digitalWrite(AIN1, LOW);
+  digitalWrite(AIN2, LOW);
+}
+void brakeB() {
+  digitalWrite(BIN1, LOW);
+  digitalWrite(BIN2, LOW);
+}
+void standbyMotors(bool standby) {
+  if (standby == true) {
+    digitalWrite(STBY, LOW);
   }
   else {
-    motor_run(abs(out), 0);                       // drive motor CCW
+    digitalWrite(STBY, HIGH);
   }
 }
-
-void motor_run(int32_t pulse, uint32_t dir ) {
-  motorController.Enable();
-  if (dir == 1) {
-    motorController.TurnLeft(pulse);
-  }
-  else if (dir == 0) {
-    motorController.TurnRight(pulse);
+void initMotors() {
+  pinMode(AIN1, OUTPUT);
+  pinMode(AIN2, OUTPUT);
+  pinMode(PWMA, OUTPUT);
+  pinMode(BIN1, OUTPUT);
+  pinMode(BIN2, OUTPUT);
+  pinMode(PWMB, OUTPUT);
+  pinMode(STBY, OUTPUT);
+  //analogWriteResolution(ANALOG_WRITE_BITS);
+  standbyMotors(false);
+}
+void initEncoders() {
+  pinMode(ENCA, INPUT_PULLUP);
+  pinMode(ENCB, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(ENCA), isr_A, RISING);
+  attachInterrupt(digitalPinToInterrupt(ENCB), isr_B, RISING);
+}
+void initPWM() {
+  startTimeA = millis();
+  startTimeB = millis();
+  motorA.SetOutputLimits(MIN_PWM, MAX_PWM);
+  motorB.SetOutputLimits(MIN_PWM, MAX_PWM);
+  motorA.SetSampleTime(SAMPLE_TIME);
+  motorB.SetSampleTime(SAMPLE_TIME);
+  motorA.SetMode(AUTOMATIC);
+  motorB.SetMode(AUTOMATIC);
+}
+void isr_A() {
+  // count sufficient interrupts to get accurate timing
+  // inputX is the encoder frequency in Hz
+  countIntA++;
+  if (countIntA == INT_COUNT) {
+    inputA = (float) INT_COUNT * 1000 / (float)(nowTime - startTimeA);
+    startTimeA = nowTime;
+    countIntA = 0;
   }
 }
-
-void encoder()  {                                     // pulse and direction, direct port reading to save cycles
-  if (PINB & 0b00000001)    encoderPos++;             // if(digitalRead(encodPinB1)==HIGH)   count ++;
-  else                      encoderPos--;             // if(digitalRead(encodPinB1)==LOW)   count --;
+void isr_B() {
+  // count sufficient interrupts to get accurate timing
+  // inputX is the encoder frequency in Hz
+  countIntB++;
+  if (countIntB == INT_COUNT) {
+    inputB = (float) INT_COUNT * 1000 / (float)(nowTime - startTimeB);
+    startTimeB = nowTime;
+    countIntB = 0;
+  }
 }
